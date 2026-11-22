@@ -35,7 +35,10 @@ def tg_call(method: str, payload: dict | None = None) -> dict:
 
 
 def send_reply(text: str):
-    tg_call("sendMessage", {"chat_id": ALLOWED_CHAT_ID, "text": text})
+    try:
+        tg_call("sendMessage", {"chat_id": ALLOWED_CHAT_ID, "text": text})
+    except Exception as exc:
+        print("send_reply error:", exc, flush=True)
 
 
 def parse_message(text: str):
@@ -126,10 +129,7 @@ def push_and_monitor_kernel(stream_url: str, section: str, clips: int, posts: in
 
 
 def main():
-    try:
-        send_reply("🤖 Bot online. Send a stream URL or `/clip <url> <section|full> <clips> <posts>`.")
-    except Exception as exc:
-        print("Startup notify skipped:", exc, flush=True)
+    send_reply("🤖 Bot online. Send a stream URL or `/clip <url> <section|full> <clips> <posts>`.")
 
     offset = 0
     while True:
@@ -138,7 +138,10 @@ def main():
             for upd in res.get("result", []):
                 offset = upd["update_id"] + 1
                 msg = upd.get("message") or {}
-                if msg.get("chat", {}).get("id") != ALLOWED_CHAT_ID:
+                chat_id = msg.get("chat", {}).get("id")
+                if chat_id is not None:
+                    print("INCOMING CHAT ID:", chat_id, "ALLOWED:", ALLOWED_CHAT_ID, flush=True)
+                if chat_id != ALLOWED_CHAT_ID:
                     continue
                 text = (msg.get("text") or "").strip()
                 parsed = parse_message(text)
