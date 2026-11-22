@@ -32,7 +32,9 @@ VIDEO_EXTS = (".mp4", ".mov", ".mkv", ".webm")
 
 # Per-chat interactive wizard state: chat_id -> {"step": ..., "config": {...}}
 PENDING_SESSIONS: dict[int, dict] = {}
-SESSION_LOCK = threading.Lock()
+# Per-chat active run cancel event: chat_id -> threading.Event
+ACTIVE_RUN_CANCELS: dict[int, threading.Event] = {}
+STATE_LOCK = threading.Lock()
 
 
 def tg_call(method: str, payload: dict | None = None) -> dict:
@@ -109,6 +111,32 @@ def check_and_send_status(chat_id: int):
         send_reply(f"❌ Status check error:\n{str(exc)[:800]}", chat_id=chat_id)
 
 
+def handle_cancel_request(chat_id: int):
+    cancelled_wizard = False
+    cancelled_run = False
+
+    with STATE_LOCK:
+        if chat_id in PENDING_SESSIONS:
+            PENDING_SESSIONS.pop(chat_id, None)
+            cancelled_wizard = True
+        run_ev = ACTIVE_RUN_CANCELS.get(chat_id)
+        if run_ev is not None:
+            run_ev.set()
+            cancelled_run = True
+
+    if cancelled_wizard and not cancelled_run:
+        send_reply("🛑 Setup cancelled. Send a stream URL anytime to start again.", chat_id=chat_id)
+    elif cancelled_run:
+        send_reply(
+            "🛑 Monitoring stopped for the active run.\n"
+            "Note: Kaggle CLI does not stop a remote session by slug alone—if the notebook is still running on Kaggle, "
+            "stop its session in Kaggle's Active Events / Sessions tab so GPU/quota isn't used.",
+            chat_id=chat_id,
+        )
+    else:
+        send_reply("ℹ️ No active setup prompt or monitored run to cancel right now.", chat_id=chat_id)
+
+
 def extract_url_if_present(text: str) -> str | None:
     parts = text.strip().split()
     if parts and parts[0].startswith("/clip"):
@@ -168,9 +196,11 @@ def extract_zip_archives(root_dir: Path):
             print("Skipping invalid zip archive:", zp.name, flush=True)
 
 
-def fetch_and_send_clips(chat_id: int):
+def fetch_and_send_clips(chat_id: int, cancel_event: threading.Event):
     out_dir = Path(tempfile.mkdtemp(prefix="tg_clips_"))
     try:
+        if cancel_event.is_set():
+            return
         send_reply(f"⬇️ Downloading generated output from `{KERNEL_SLUG}`...", chat_id=chat_id)
         subprocess.run(
             ["kaggle", "kernels", "output", KERNEL_SLUG, "-p", str(out_dir), "--force"],
@@ -178,6 +208,9 @@ def fetch_and_send_clips(chat_id: int):
             capture_output=True,
             text=True,
         )
+
+        if cancel_event.is_set():
+            return
 
         extract_zip_archives(out_dir)
 
@@ -196,6 +229,10 @@ def fetch_and_send_clips(chat_id: int):
 
         sent_count = 0
         for idx, vid_path in enumerate(video_files, start=1):
+            if cancel_event.is_set():
+                send_reply("🛑 Clip upload stopped because /cancel was sent.", chat_id=chat_id)
+                return
+
             size_mb = vid_path.stat().st_size / (1024 * 1024)
             if vid_path.stat().st_size > MAX_TG_VIDEO_BYTES:
                 send_reply(
@@ -219,7 +256,7 @@ def fetch_and_send_clips(chat_id: int):
         shutil.rmtree(out_dir, ignore_errors=True)
 
 
-def push_and_monitor_kernel(cfg: dict, chat_id: int):
+def push_and_monitor_kernel(cfg: dict, chat_id: int, cancel_event: threading.Event):
     work_dir = Path(tempfile.mkdtemp(prefix="tg_kernel_"))
     try:
         send_reply(f"📥 Pulling {KERNEL_SLUG} and updating Cell 1...", chat_id=chat_id)
@@ -272,13 +309,14 @@ def push_and_monitor_kernel(cfg: dict, chat_id: int):
             f"• Length/Section: {cfg['clip_length'] or 'full'}\n"
             f"• Post: {'Yes (' + str(cfg['post_count']) + ')' if cfg['should_post'] else 'No'}\n"
             f"• Captions: {'Yes (' + cfg['captions_style'] + ')' if cfg['captions_enabled'] else 'No'}\n"
-            f"Send /status anytime to check progress.",
+            f"Send /status to check progress or /cancel to stop monitoring.",
             chat_id=chat_id,
         )
 
         last_status = None
-        while True:
-            time.sleep(60)
+        while not cancel_event.is_set():
+            if cancel_event.wait(timeout=60):
+                break
             status = get_kernel_status()
             if status != last_status:
                 send_reply(f"🔄 Status update:\n{status}", chat_id=chat_id)
@@ -287,7 +325,7 @@ def push_and_monitor_kernel(cfg: dict, chat_id: int):
             low = status.lower()
             if "complete" in low:
                 send_reply(f"✅ Kaggle run completed!\n{status}", chat_id=chat_id)
-                fetch_and_send_clips(chat_id)
+                fetch_and_send_clips(chat_id, cancel_event)
                 break
             if "error" in low or "cancel" in low:
                 send_reply(f"⚠️ Kaggle run ended:\n{status}", chat_id=chat_id)
@@ -299,6 +337,9 @@ def push_and_monitor_kernel(cfg: dict, chat_id: int):
     except Exception as exc:
         send_reply(f"❌ Error:\n{str(exc)[:800]}", chat_id=chat_id)
     finally:
+        with STATE_LOCK:
+            if ACTIVE_RUN_CANCELS.get(chat_id) is cancel_event:
+                ACTIVE_RUN_CANCELS.pop(chat_id, None)
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
@@ -330,15 +371,24 @@ def ask_next_question(chat_id: int, step: str):
         )
 
 
+def start_run_thread(cfg: dict, chat_id: int):
+    cancel_event = threading.Event()
+    with STATE_LOCK:
+        old_ev = ACTIVE_RUN_CANCELS.get(chat_id)
+        if old_ev is not None:
+            old_ev.set()
+        ACTIVE_RUN_CANCELS[chat_id] = cancel_event
+
+    threading.Thread(target=push_and_monitor_kernel, args=(cfg, chat_id, cancel_event), daemon=True).start()
+
+
 def handle_wizard_answer(chat_id: int, text: str):
     low = text.strip().lower()
     if low in ("/cancel", "cancel"):
-        with SESSION_LOCK:
-            PENDING_SESSIONS.pop(chat_id, None)
-        send_reply("🛑 Setup cancelled. Send a stream URL anytime to start again.", chat_id=chat_id)
+        handle_cancel_request(chat_id)
         return
 
-    with SESSION_LOCK:
+    with STATE_LOCK:
         session = PENDING_SESSIONS.get(chat_id)
     if not session:
         return
@@ -403,15 +453,15 @@ def handle_wizard_answer(chat_id: int, text: str):
             cfg["captions_enabled"] = True
             cfg["captions_style"] = text.strip()
 
-        with SESSION_LOCK:
+        with STATE_LOCK:
             PENDING_SESSIONS.pop(chat_id, None)
 
-        threading.Thread(target=push_and_monitor_kernel, args=(cfg, chat_id), daemon=True).start()
+        start_run_thread(cfg, chat_id)
 
 
 def main():
     send_reply(
-        "🤖 Bot online! Send a stream URL to configure Cell 1 step-by-step, or send `/status` to check Kaggle.",
+        "🤖 Bot online! Send a stream URL to configure Cell 1 step-by-step, `/status` for status, or `/cancel` to stop.",
         chat_id=ALLOWED_CHAT_ID,
     )
 
@@ -432,13 +482,18 @@ def main():
                 if not text:
                     continue
 
-                if text.lower() in ("/status", "status"):
+                low = text.lower()
+                if low in ("/status", "status"):
                     threading.Thread(target=check_and_send_status, args=(chat_id,), daemon=True).start()
+                    continue
+
+                if low in ("/cancel", "cancel"):
+                    handle_cancel_request(chat_id)
                     continue
 
                 url = extract_url_if_present(text)
                 if url:
-                    with SESSION_LOCK:
+                    with STATE_LOCK:
                         PENDING_SESSIONS[chat_id] = {
                             "step": "clips_count",
                             "config": {
@@ -455,7 +510,7 @@ def main():
                     ask_next_question(chat_id, "clips_count")
                     continue
 
-                with SESSION_LOCK:
+                with STATE_LOCK:
                     in_session = chat_id in PENDING_SESSIONS
                 if in_session:
                     handle_wizard_answer(chat_id, text)
