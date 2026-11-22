@@ -148,3 +148,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+    try:
+        send_reply("🤖 Bot online. Send a stream URL or `/clip <url> <section|full> <clips> <posts>`.")
+    except Exception as exc:
+        print("Startup notify skipped:", exc, flush=True)
