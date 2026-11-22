@@ -10,7 +10,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 print("ENV KEYS:", sorted(k for k in os.environ.keys() if "TG" in k or "KAGGLE" in k or "KERNEL" in k), flush=True)
-TG_BOT_TOKEN = os.environ["TG_BOT_TOKEN"].strip()
+BOT_TOKEN = os.environ["TG_BOT_TOKEN"].strip()
 ALLOWED_CHAT_ID = int(os.environ["TG_CHAT_ID"].strip())
 KERNEL_SLUG = os.environ["KERNEL_SLUG"].strip()
 
