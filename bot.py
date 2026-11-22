@@ -1,4 +1,5 @@
 import json
+import mimetypes
 import os
 import re
 import shutil
@@ -8,6 +9,8 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+import uuid
+import zipfile
 from pathlib import Path
 
 BOT_TOKEN = os.environ["TG_BOT_TOKEN"].strip()
@@ -24,6 +27,12 @@ if kg_api_token:
     os.chmod(token_file, 0o600)
 
 TG_API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
+MAX_TG_VIDEO_BYTES = 50 * 1024 * 1024  # 50 MB Bot API upload limit
+VIDEO_EXTS = (".mp4", ".mov", ".mkv", ".webm")
+
+# Per-chat interactive wizard state: chat_id -> {"step": ..., "config": {...}}
+PENDING_SESSIONS: dict[int, dict] = {}
+SESSION_LOCK = threading.Lock()
 
 
 def tg_call(method: str, payload: dict | None = None) -> dict:
@@ -34,32 +43,186 @@ def tg_call(method: str, payload: dict | None = None) -> dict:
         return json.loads(resp.read().decode("utf-8"))
 
 
-def send_reply(text: str):
+def tg_upload_video(chat_id: int, video_path: Path, caption: str = "") -> dict:
+    boundary = f"----WebKitFormBoundary{uuid.uuid4().hex}"
+    mime_type = mimetypes.guess_type(video_path.name)[0] or "video/mp4"
+    file_bytes = video_path.read_bytes()
+
+    parts: list[bytes] = []
+
+    def add_field(name: str, value: str):
+        parts.append(
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
+            f"{value}\r\n".encode("utf-8")
+        )
+
+    add_field("chat_id", str(chat_id))
+    if caption:
+        add_field("caption", caption[:1024])
+    add_field("supports_streaming", "true")
+
+    parts.append(
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="video"; filename="{video_path.name}"\r\n'
+        f"Content-Type: {mime_type}\r\n\r\n".encode("utf-8")
+    )
+    parts.append(file_bytes)
+    parts.append(f"\r\n--{boundary}--\r\n".encode("utf-8"))
+
+    body = b"".join(parts)
+    url = f"{TG_API_BASE}/sendVideo"
+    req = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    with urllib.request.urlopen(req, timeout=300) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def send_reply(text: str, chat_id: int | None = None):
+    target_id = chat_id if chat_id is not None else ALLOWED_CHAT_ID
     try:
-        tg_call("sendMessage", {"chat_id": ALLOWED_CHAT_ID, "text": text})
+        tg_call("sendMessage", {"chat_id": target_id, "text": text})
     except Exception as exc:
         print("send_reply error:", exc, flush=True)
 
 
-def parse_message(text: str):
+def get_kernel_status() -> str:
+    return subprocess.check_output(
+        ["kaggle", "kernels", "status", KERNEL_SLUG],
+        text=True,
+        stderr=subprocess.STDOUT,
+    ).strip()
+
+
+def check_and_send_status(chat_id: int):
+    try:
+        status = get_kernel_status()
+        send_reply(f"📊 Kaggle status for `{KERNEL_SLUG}`:\n{status}", chat_id=chat_id)
+    except subprocess.CalledProcessError as exc:
+        err = (exc.output or str(exc))[:800]
+        send_reply(f"❌ Status check error:\n{err}", chat_id=chat_id)
+    except Exception as exc:
+        send_reply(f"❌ Status check error:\n{str(exc)[:800]}", chat_id=chat_id)
+
+
+def extract_url_if_present(text: str) -> str | None:
     parts = text.strip().split()
     if parts and parts[0].startswith("/clip"):
         parts = parts[1:]
-    if not parts or not parts[0].startswith("http"):
-        return None
-    url = parts[0]
-    section = parts[1] if len(parts) > 1 else "0:00:00-1:00:00"
-    if section.lower() == "full":
-        section = ""
-    clips = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 3
-    posts = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 1
-    return url, section, clips, posts
+    if parts and parts[0].startswith("http"):
+        return parts[0]
+    return None
 
 
-def push_and_monitor_kernel(stream_url: str, section: str, clips: int, posts: int):
+def set_py_assignment(src: str, var_name: str, value: str, is_string: bool = True) -> str:
+    """Replace an existing assignment or append it to Cell 1 if missing."""
+    if is_string:
+        escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+        replacement = f'{var_name} = "{escaped}"'
+    else:
+        replacement = f"{var_name} = {value}"
+    pattern = rf"(?m)^[ \t]*{re.escape(var_name)}\s*=.*$"
+
+    if re.search(pattern, src):
+        return re.sub(pattern, replacement, src)
+    return src.rstrip() + f"\n{replacement}\n"
+
+
+def update_cell_1_source(src: str, cfg: dict) -> str:
+    should_post = bool(cfg["should_post"])
+    post_count = int(cfg["post_count"]) if should_post else 0
+    captions_enabled = bool(cfg["captions_enabled"])
+    captions_style = str(cfg["captions_style"])
+
+    src = set_py_assignment(src, "STREAM_URL", cfg["stream_url"], is_string=True)
+    src = set_py_assignment(src, "CLIPS_COUNT", str(int(cfg["clips_count"])), is_string=False)
+    src = set_py_assignment(src, "CLIP_LENGTH", cfg["clip_length"], is_string=True)
+    src = set_py_assignment(src, "SECTION", cfg["clip_length"], is_string=True)
+    src = set_py_assignment(src, "SHOULD_POST", "True" if should_post else "False", is_string=False)
+    src = set_py_assignment(src, "AUTO_POST", "True" if should_post else "False", is_string=False)
+    src = set_py_assignment(src, "POST_COUNT", str(post_count), is_string=False)
+    src = set_py_assignment(src, "CAPTIONS", "True" if captions_enabled else "False", is_string=False)
+    src = set_py_assignment(src, "ENABLE_CAPTIONS", "True" if captions_enabled else "False", is_string=False)
+    src = set_py_assignment(src, "CAPTION_STYLE", captions_style, is_string=True)
+    return src
+
+
+def extract_zip_archives(root_dir: Path):
+    """Extract any .zip files in root_dir into subfolders safely."""
+    zip_files = [p for p in root_dir.rglob("*") if p.is_file() and p.suffix.lower() == ".zip"]
+    for zp in zip_files:
+        extract_dir = zp.parent / f"_unzipped_{zp.stem}"
+        extract_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            with zipfile.ZipFile(zp, "r") as zf:
+                for member in zf.infolist():
+                    target_path = (extract_dir / member.filename).resolve()
+                    if not str(target_path).startswith(str(extract_dir.resolve())):
+                        continue
+                    zf.extract(member, extract_dir)
+        except zipfile.BadZipFile:
+            print("Skipping invalid zip archive:", zp.name, flush=True)
+
+
+def fetch_and_send_clips(chat_id: int):
+    out_dir = Path(tempfile.mkdtemp(prefix="tg_clips_"))
+    try:
+        send_reply(f"⬇️ Downloading generated output from `{KERNEL_SLUG}`...", chat_id=chat_id)
+        subprocess.run(
+            ["kaggle", "kernels", "output", KERNEL_SLUG, "-p", str(out_dir), "--force"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        extract_zip_archives(out_dir)
+
+        video_files = sorted(
+            [p for p in out_dir.rglob("*") if p.is_file() and p.suffix.lower() in VIDEO_EXTS],
+            key=lambda p: p.name.lower(),
+        )
+
+        if not video_files:
+            found_names = [p.name for p in out_dir.rglob("*") if p.is_file()]
+            send_reply(
+                f"ℹ️ Run completed, but no video files were found.\nFiles downloaded: {', '.join(found_names) or 'none'}",
+                chat_id=chat_id,
+            )
+            return
+
+        sent_count = 0
+        for idx, vid_path in enumerate(video_files, start=1):
+            size_mb = vid_path.stat().st_size / (1024 * 1024)
+            if vid_path.stat().st_size > MAX_TG_VIDEO_BYTES:
+                send_reply(
+                    f"⚠️ Skipped `{vid_path.name}` ({size_mb:.1f} MB) — exceeds Telegram's 50 MB bot upload limit.",
+                    chat_id=chat_id,
+                )
+                continue
+
+            send_reply(f"📤 Sending clip {idx}/{len(video_files)}: `{vid_path.name}` ({size_mb:.1f} MB)...", chat_id=chat_id)
+            tg_upload_video(chat_id=chat_id, video_path=vid_path, caption=f"🎬 {vid_path.name}")
+            sent_count += 1
+
+        send_reply(f"✅ Sent {sent_count} clip(s) to Telegram.", chat_id=chat_id)
+
+    except subprocess.CalledProcessError as exc:
+        err = (exc.stderr or exc.stdout or str(exc))[:800]
+        send_reply(f"❌ Output download error:\n{err}", chat_id=chat_id)
+    except Exception as exc:
+        send_reply(f"❌ Clip delivery error:\n{str(exc)[:800]}", chat_id=chat_id)
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def push_and_monitor_kernel(cfg: dict, chat_id: int):
     work_dir = Path(tempfile.mkdtemp(prefix="tg_kernel_"))
     try:
-        send_reply(f"📥 Pulling {KERNEL_SLUG} and updating settings...")
+        send_reply(f"📥 Pulling {KERNEL_SLUG} and updating Cell 1...", chat_id=chat_id)
         subprocess.run(
             ["kaggle", "kernels", "pull", "-m", "-p", str(work_dir), "-k", KERNEL_SLUG],
             check=True,
@@ -73,16 +236,20 @@ def push_and_monitor_kernel(stream_url: str, section: str, clips: int, posts: in
         nb_path = ipynb_files[0]
         nb = json.loads(nb_path.read_text(encoding="utf-8"))
 
-        for cell in nb.get("cells", []):
+        cells = nb.get("cells", [])
+        target_idx = None
+        for idx, cell in enumerate(cells):
             if cell.get("cell_type") == "code":
                 src = "".join(cell.get("source", []))
-                if "STREAM_URL" in src:
-                    src = re.sub(r'STREAM_URL\s*=\s*".*?"', f'STREAM_URL = "{stream_url}"', src)
-                    src = re.sub(r'SECTION\s*=\s*".*?"', f'SECTION = "{section}"', src)
-                    src = re.sub(r"CLIPS_COUNT\s*=\s*\d+", f"CLIPS_COUNT = {clips}", src)
-                    src = re.sub(r"POST_COUNT\s*=\s*\d+", f"POST_COUNT = {posts}", src)
-                    cell["source"] = [line + "\n" for line in src.splitlines()]
-                    break
+                if "STREAM_URL" in src or idx == 0:
+                    target_idx = idx
+                    if "STREAM_URL" in src:
+                        break
+
+        if target_idx is not None:
+            old_src = "".join(cells[target_idx].get("source", []))
+            new_src = update_cell_1_source(old_src, cfg)
+            cells[target_idx]["source"] = [line + "\n" for line in new_src.splitlines()]
 
         nb_path.write_text(json.dumps(nb, indent=2), encoding="utf-8")
 
@@ -99,37 +266,154 @@ def push_and_monitor_kernel(stream_url: str, section: str, clips: int, posts: in
             text=True,
         )
         send_reply(
-            f"🚀 Kaggle run started!\n"
-            f"• URL: {stream_url}\n"
-            f"• Section: {section or 'full'}\n"
-            f"• Clips: {clips} | Reels to post: {posts}"
+            f"🚀 Kaggle run pushed!\n"
+            f"• URL: {cfg['stream_url']}\n"
+            f"• Clips: {cfg['clips_count']}\n"
+            f"• Length/Section: {cfg['clip_length'] or 'full'}\n"
+            f"• Post: {'Yes (' + str(cfg['post_count']) + ')' if cfg['should_post'] else 'No'}\n"
+            f"• Captions: {'Yes (' + cfg['captions_style'] + ')' if cfg['captions_enabled'] else 'No'}\n"
+            f"Send /status anytime to check progress.",
+            chat_id=chat_id,
         )
 
+        last_status = None
         while True:
             time.sleep(60)
-            status = subprocess.check_output(
-                ["kaggle", "kernels", "status", KERNEL_SLUG],
-                text=True,
-            ).strip()
+            status = get_kernel_status()
+            if status != last_status:
+                send_reply(f"🔄 Status update:\n{status}", chat_id=chat_id)
+                last_status = status
+
             low = status.lower()
             if "complete" in low:
-                send_reply(f"✅ Kaggle run completed!\n{status}")
+                send_reply(f"✅ Kaggle run completed!\n{status}", chat_id=chat_id)
+                fetch_and_send_clips(chat_id)
                 break
             if "error" in low or "cancel" in low:
-                send_reply(f"⚠️ Kaggle run ended:\n{status}")
+                send_reply(f"⚠️ Kaggle run ended:\n{status}", chat_id=chat_id)
                 break
 
     except subprocess.CalledProcessError as exc:
         err = (exc.stderr or exc.stdout or str(exc))[:800]
-        send_reply(f"❌ Kaggle CLI error:\n{err}")
+        send_reply(f"❌ Kaggle CLI error:\n{err}", chat_id=chat_id)
     except Exception as exc:
-        send_reply(f"❌ Error:\n{str(exc)[:800]}")
+        send_reply(f"❌ Error:\n{str(exc)[:800]}", chat_id=chat_id)
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
+def ask_next_question(chat_id: int, step: str):
+    if step == "clips_count":
+        send_reply(
+            "1️⃣ **How many clips** do you want to generate? (e.g. `3`, or type `skip` for `3`)",
+            chat_id=chat_id,
+        )
+    elif step == "clip_length":
+        send_reply(
+            "2️⃣ **What clip length or section**? (e.g. `60s`, `0:00:00-0:30:00`, or `full` / `skip` for `0:00:00-1:00:00`)",
+            chat_id=chat_id,
+        )
+    elif step == "should_post":
+        send_reply(
+            "3️⃣ **Is it going to post or not?** Reply `yes` or `no` (or `skip` for `yes`)",
+            chat_id=chat_id,
+        )
+    elif step == "post_count":
+        send_reply(
+            "3b️⃣ **How many posts/reels** should it publish? (e.g. `1`, or `skip` for `1`)",
+            chat_id=chat_id,
+        )
+    elif step == "captions":
+        send_reply(
+            "4️⃣ **Captions?** Reply `yes` / `no` or a caption style (e.g. `yes bold`, `no`, or `skip` for `yes`)",
+            chat_id=chat_id,
+        )
+
+
+def handle_wizard_answer(chat_id: int, text: str):
+    low = text.strip().lower()
+    if low in ("/cancel", "cancel"):
+        with SESSION_LOCK:
+            PENDING_SESSIONS.pop(chat_id, None)
+        send_reply("🛑 Setup cancelled. Send a stream URL anytime to start again.", chat_id=chat_id)
+        return
+
+    with SESSION_LOCK:
+        session = PENDING_SESSIONS.get(chat_id)
+    if not session:
+        return
+
+    step = session["step"]
+    cfg = session["config"]
+    is_default = low in ("skip", "default", "")
+
+    if step == "clips_count":
+        if is_default:
+            cfg["clips_count"] = 3
+        elif text.strip().isdigit() and int(text.strip()) > 0:
+            cfg["clips_count"] = int(text.strip())
+        else:
+            send_reply("Please enter a valid positive number for clips (e.g. `3`) or `skip`.", chat_id=chat_id)
+            return
+        session["step"] = "clip_length"
+        ask_next_question(chat_id, "clip_length")
+
+    elif step == "clip_length":
+        if is_default:
+            cfg["clip_length"] = "0:00:00-1:00:00"
+        elif low == "full":
+            cfg["clip_length"] = ""
+        else:
+            cfg["clip_length"] = text.strip()
+        session["step"] = "should_post"
+        ask_next_question(chat_id, "should_post")
+
+    elif step == "should_post":
+        if is_default or low in ("y", "yes", "true", "1", "post"):
+            cfg["should_post"] = True
+            session["step"] = "post_count"
+            ask_next_question(chat_id, "post_count")
+        elif low in ("n", "no", "false", "0", "dont post", "don't post", "no post"):
+            cfg["should_post"] = False
+            cfg["post_count"] = 0
+            session["step"] = "captions"
+            ask_next_question(chat_id, "captions")
+        else:
+            send_reply("Please reply `yes` or `no` (or `skip`).", chat_id=chat_id)
+
+    elif step == "post_count":
+        if is_default:
+            cfg["post_count"] = 1
+        elif text.strip().isdigit() and int(text.strip()) >= 0:
+            cfg["post_count"] = int(text.strip())
+        else:
+            send_reply("Please enter a valid number for posts (e.g. `1`) or `skip`.", chat_id=chat_id)
+            return
+        session["step"] = "captions"
+        ask_next_question(chat_id, "captions")
+
+    elif step == "captions":
+        if is_default or low in ("y", "yes", "true", "on", "1"):
+            cfg["captions_enabled"] = True
+            cfg["captions_style"] = "default"
+        elif low in ("n", "no", "false", "off", "0"):
+            cfg["captions_enabled"] = False
+            cfg["captions_style"] = "none"
+        else:
+            cfg["captions_enabled"] = True
+            cfg["captions_style"] = text.strip()
+
+        with SESSION_LOCK:
+            PENDING_SESSIONS.pop(chat_id, None)
+
+        threading.Thread(target=push_and_monitor_kernel, args=(cfg, chat_id), daemon=True).start()
+
+
 def main():
-    send_reply("🤖 Bot online. Send a stream URL or `/clip <url> <section|full> <clips> <posts>`.")
+    send_reply(
+        "🤖 Bot online! Send a stream URL to configure Cell 1 step-by-step, or send `/status` to check Kaggle.",
+        chat_id=ALLOWED_CHAT_ID,
+    )
 
     offset = 0
     while True:
@@ -143,11 +427,39 @@ def main():
                     print("INCOMING CHAT ID:", chat_id, "ALLOWED:", ALLOWED_CHAT_ID, flush=True)
                 if chat_id != ALLOWED_CHAT_ID:
                     continue
+
                 text = (msg.get("text") or "").strip()
-                parsed = parse_message(text)
-                if not parsed:
+                if not text:
                     continue
-                threading.Thread(target=push_and_monitor_kernel, args=parsed, daemon=True).start()
+
+                if text.lower() in ("/status", "status"):
+                    threading.Thread(target=check_and_send_status, args=(chat_id,), daemon=True).start()
+                    continue
+
+                url = extract_url_if_present(text)
+                if url:
+                    with SESSION_LOCK:
+                        PENDING_SESSIONS[chat_id] = {
+                            "step": "clips_count",
+                            "config": {
+                                "stream_url": url,
+                                "clips_count": 3,
+                                "clip_length": "0:00:00-1:00:00",
+                                "should_post": True,
+                                "post_count": 1,
+                                "captions_enabled": True,
+                                "captions_style": "default",
+                            },
+                        }
+                    send_reply(f"🎬 Got URL:\n{url}\nLet's set up Cell 1 (type `cancel` anytime to stop).", chat_id=chat_id)
+                    ask_next_question(chat_id, "clips_count")
+                    continue
+
+                with SESSION_LOCK:
+                    in_session = chat_id in PENDING_SESSIONS
+                if in_session:
+                    handle_wizard_answer(chat_id, text)
+
         except Exception as exc:
             print("Telegram poll error:", exc, flush=True)
             time.sleep(5)
