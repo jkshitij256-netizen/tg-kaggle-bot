@@ -9,7 +9,7 @@ import time
 import urllib.parse
 import urllib.request
 from pathlib import Path
-print("ENV KEYS:", sorted(k for k in os.environ.keys() if "TG" in k or "KAGGLE" in k or "KERNEL" in k), flush=True)
+
 BOT_TOKEN = os.environ["TG_BOT_TOKEN"].strip()
 ALLOWED_CHAT_ID = int(os.environ["TG_CHAT_ID"].strip())
 KERNEL_SLUG = os.environ["KERNEL_SLUG"].strip()
@@ -56,7 +56,7 @@ def parse_message(text: str):
 def push_and_monitor_kernel(stream_url: str, section: str, clips: int, posts: int):
     work_dir = Path(tempfile.mkdtemp(prefix="tg_kernel_"))
     try:
-        send_reply(f"📥 Pulling `{KERNEL_SLUG}` and updating settings...")
+        send_reply(f"📥 Pulling {KERNEL_SLUG} and updating settings...")
         subprocess.run(
             ["kaggle", "kernels", "pull", "-m", "-p", str(work_dir), "-k", KERNEL_SLUG],
             check=True,
@@ -126,7 +126,11 @@ def push_and_monitor_kernel(stream_url: str, section: str, clips: int, posts: in
 
 
 def main():
-    send_reply("🤖 Bot online. Send a stream URL or `/clip <url> <section|full> <clips> <posts>`.")
+    try:
+        send_reply("🤖 Bot online. Send a stream URL or `/clip <url> <section|full> <clips> <posts>`.")
+    except Exception as exc:
+        print("Startup notify skipped:", exc, flush=True)
+
     offset = 0
     while True:
         try:
@@ -142,13 +146,9 @@ def main():
                     continue
                 threading.Thread(target=push_and_monitor_kernel, args=parsed, daemon=True).start()
         except Exception as exc:
-            print("Telegram poll error:", exc)
+            print("Telegram poll error:", exc, flush=True)
             time.sleep(5)
 
 
 if __name__ == "__main__":
     main()
-    try:
-        send_reply("🤖 Bot online. Send a stream URL or `/clip <url> <section|full> <clips> <posts>`.")
-    except Exception as exc:
-        print("Startup notify skipped:", exc, flush=True)
